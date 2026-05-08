@@ -7,6 +7,9 @@ export interface Card {
   expansion: string;
   source: string;
   url: string;
+  dateAdded: string;
+  quantity: number;
+  notes?: string;
 }
 
 export interface ScrapeResult {
