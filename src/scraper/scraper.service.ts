@@ -1,4 +1,5 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, OnModuleDestroy } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
 import { chromium, Browser, BrowserContext } from 'playwright';
 import { Card, ScrapeResult } from './interfaces/card.interface';
 
@@ -10,10 +11,26 @@ interface RawCard {
   url: string;
 }
 
+export interface RefreshResult {
+  success: boolean;
+  card?: Card;
+  error?: string;
+}
+
+export interface BatchRefreshResult {
+  updated: number;
+  failed: number;
+  failedUrls: { url: string; error: string }[];
+  cards: Card[];
+}
+
 @Injectable()
-export class ScraperService {
+export class ScraperService implements OnModuleDestroy {
   private readonly logger = new Logger(ScraperService.name);
   private browser: Browser | null = null;
+  private readonly SCRAPE_DELAY_MS = 1500;
+
+  constructor(private readonly prisma: PrismaService) {}
 
   private async getBrowser(): Promise<Browser> {
     if (!this.browser || !this.browser.isConnected()) {
@@ -54,14 +71,167 @@ export class ScraperService {
 
       const price = raw.rawPrice.replace(/Market Price:/i, '').trim() || 'N/A';
 
-      // "Common, #ROS231" → cardId = "ROS231", rarity = "Common"
       const cardId = raw.rarity.includes('#')
         ? (raw.rarity.split('#')[1]?.trim() ?? '')
         : '';
       const rarity = raw.rarity.split(',')[0].trim();
 
-      return { name, image: raw.image, price, rarity, cardId, expansion, source, url: raw.url };
+      return { name, image: raw.image, price, rarity, cardId, expansion, source, url: raw.url, dateAdded: new Date().toISOString(), quantity: 1, notes: undefined };
     });
+  }
+
+  private parsePrice(priceStr: string): number {
+    const cleaned = priceStr.replace(/[^0-9.]/g, '');
+    return parseFloat(cleaned) || 0;
+  }
+
+  private async scrapeCardPage(url: string): Promise<Partial<Card>> {
+    const browser = await this.getBrowser();
+    const context: BrowserContext = await browser.newContext({
+      userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 900 },
+      locale: 'en-US',
+    });
+
+    const tab = await context.newPage();
+
+    try {
+      this.logger.log(`Scraping card page: ${url}`);
+      await tab.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+      await tab.waitForTimeout(2000);
+
+      const cardData = await tab.evaluate((): Partial<Card> => {
+        const getText = (selector: string) => {
+          const el = document.querySelector(selector);
+          return el?.textContent?.trim() ?? '';
+        };
+
+        const getAttr = (selector: string, attr: string) => {
+          const el = document.querySelector(selector);
+          return el?.getAttribute(attr) ?? '';
+        };
+
+        const name = getText('.product-details__name') || getText('h1[itemprop="name"]') || '';
+        const image = getAttr('img.product-image', 'src') || getAttr('[data-testid="product-image"] img', 'src') || '';
+        const price = getText('.product-price__final') || getText('[data-testid="price"]') || getText('.price') || '';
+        const rarity = getText('[class*="rarity"]') || getText('.product-details__rarity') || '';
+        const expansion = getText('[class*="expansion"]') || getText('.product-details__expansion') || '';
+        const cardIdMatch = document.body.textContent?.match(/#([A-Z0-9]+)/);
+        const cardId = cardIdMatch ? cardIdMatch[1] : '';
+
+        return { name, image, price, rarity, expansion, cardId };
+      });
+
+      return cardData;
+    } finally {
+      await tab.close();
+      await context.close();
+    }
+  }
+
+  private async delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async refreshCard(url: string): Promise<RefreshResult> {
+    try {
+      const card = await this.prisma.card.findFirst({ where: { url } });
+      if (!card) {
+        await this.prisma.unmatchedUrlError.create({
+          data: {
+            url,
+            error: 'Card not found in database',
+          },
+        });
+        return { success: false, error: `Card not found for URL: ${url}` };
+      }
+
+      const scrapedData = await this.scrapeCardPage(url);
+
+      if (!scrapedData.name) {
+        await this.prisma.scrapeError.create({
+          data: {
+            cardId: card.id,
+            url,
+            error: 'Failed to extract card data - no name found',
+            details: JSON.stringify(scrapedData),
+          },
+        });
+        return { success: false, error: 'Failed to extract card data from page' };
+      }
+
+      const priceValue = this.parsePrice(scrapedData.price || '0');
+      const source = new URL(url).hostname.replace(/^www\./, '').split('.')[0];
+
+      const updatedCard = await this.prisma.card.update({
+        where: { id: card.id },
+        data: {
+          name: scrapedData.name || card.name,
+          image: scrapedData.image || card.image,
+          price: scrapedData.price || card.price,
+          priceValue: priceValue || card.priceValue,
+          rarity: scrapedData.rarity || card.rarity,
+          expansion: scrapedData.expansion || card.expansion,
+          cardId: scrapedData.cardId || card.cardId,
+          source: source || card.source,
+          dateAdded: card.dateAdded,
+          quantity: card.quantity,
+          notes: card.notes,
+        },
+      });
+
+      const { dateAdded, ...rest } = updatedCard;
+      const cardWithDateString: Card = {
+        ...rest,
+        dateAdded: dateAdded.toISOString(),
+      };
+
+      return { success: true, card: cardWithDateString };
+    } catch (error) {
+      const card = await this.prisma.card.findFirst({ where: { url } });
+      if (card) {
+        await this.prisma.scrapeError.create({
+          data: {
+            cardId: card.id,
+            url,
+            error: error instanceof Error ? error.message : 'Unknown error',
+            details: error instanceof Error ? error.stack : undefined,
+          },
+        });
+      }
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  async refreshCards(cardIds?: string[]): Promise<BatchRefreshResult> {
+    const cards = cardIds
+      ? await this.prisma.card.findMany({ where: { id: { in: cardIds } } })
+      : await this.prisma.card.findMany();
+
+    const result: BatchRefreshResult = {
+      updated: 0,
+      failed: 0,
+      failedUrls: [],
+      cards: [],
+    };
+
+    for (const card of cards) {
+      await this.delay(this.SCRAPE_DELAY_MS);
+
+      const refreshResult = await this.refreshCard(card.url);
+
+      if (refreshResult.success && refreshResult.card) {
+        result.updated++;
+        result.cards.push(refreshResult.card);
+      } else {
+        result.failed++;
+        result.failedUrls.push({ url: card.url, error: refreshResult.error || 'Unknown error' });
+      }
+    }
+
+    return result;
   }
 
   private async scrapeUrl(url: string, page: number): Promise<ScrapeResult> {

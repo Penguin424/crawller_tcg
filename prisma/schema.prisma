@@ -1,0 +1,45 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Card {
+  id         String   @id @default(uuid())
+  name       String
+  image      String
+  price      String
+  priceValue Float
+  rarity     String
+  cardId     String
+  expansion  String
+  source     String
+  url        String
+  dateAdded  DateTime
+  quantity   Int      @default(1)
+  notes      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  scrapeErrors ScrapeError[]
+}
+
+model ScrapeError {
+  id        String   @id @default(uuid())
+  cardId    String
+  url       String
+  error     String
+  details   String?
+  createdAt DateTime @default(now())
+
+  card      Card     @relation(fields: [cardId], references: [id], onDelete: Cascade)
+}
+
+model UnmatchedUrlError {
+  id        String   @id @default(uuid())
+  url       String   @unique
+  error     String
+  details   String?
+  createdAt DateTime @default(now())
+}
